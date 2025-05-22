@@ -138,6 +138,180 @@ def is_forecast_related(prompt):
     return any(kw in prompt.lower() for kw in keywords)
 
 
+def is_weather_related(prompt: str) -> bool:
+    prompt_lower = prompt.lower()
+    return any(keyword in prompt_lower for keyword in [
+        "weather"
+    ])
+
+
+def get_weather_forecast_for(prompt: str) -> str:
+    import re
+    import requests
+    import logging
+    from datetime import datetime, timedelta
+
+    logging.info("🌤️ [WEER] Start weather forecast handler...")
+    base_url = "https://api.open-meteo.com/v1/forecast"
+    lat = 50.8503  # Brussels
+    lon = 4.3517
+    today = datetime.now().date()
+    target_date = today
+
+    # Detect relative date
+    clean_prompt = prompt.lower()
+    if "tomorrow" in clean_prompt:
+        target_date = today + timedelta(days=1)
+        logging.info(f"🌤️ [WEER] Detected 'tomorrow'. Target date: {target_date}")
+    elif "yesterday" in clean_prompt:
+        target_date = today - timedelta(days=1)
+        logging.info(f"🌤️ [WEER] Detected 'yesterday'. Target date: {target_date}")
+    elif "today" in clean_prompt:
+        target_date = today
+        logging.info(f"🌤️ [WEER] Detected 'today'. Target date: {target_date}")
+    elif "day after tomorrow" in clean_prompt or "overmorrow" in clean_prompt:
+        target_date = today + timedelta(days=2)
+        logging.info(f"🌤️ [WEER] Detected 'day after tomorrow'. Target date: {target_date}")
+    elif "day before yesterday" in clean_prompt:
+        target_date = today - timedelta(days=2)
+        logging.info(f"🌤️ [WEER] Detected 'day before yesterday'. Target date: {target_date}")
+    elif "next week" in clean_prompt:
+        target_date = today + timedelta(days=7)
+        logging.info(f"🌤️ [WEER] Detected 'next week'. Target date: {target_date}")
+    elif "last week" in clean_prompt:
+        target_date = today - timedelta(days=7)
+        logging.info(f"🌤️ [WEER] Detected 'last week'. Target date: {target_date}")
+    else:
+        # Clean prompt for better regex matching (remove punctuation)
+        clean_prompt = re.sub(r'[?!.,;]', '', prompt.lower())
+        
+        # Detect specific date - supports multiple formats:
+        # "may 25", "25 may", "may 25 2025", "25 may 2025", "25/05", "05/25/2025"
+        date_patterns = [
+            # Month day format: "may 25", "may 25 2025"
+            r'(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2})(?:\s+(\d{4}))?',
+            # Day month format: "25 may", "25 may 2025"  
+            r'(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(?:\s+(\d{4}))?',
+            # Numeric formats: "05/25", "25/05", "05/25/2025", "25/05/2025"
+            r'(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?'
+        ]
+        
+        day = month = year = None
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, clean_prompt)
+            if match:
+                logging.info(f"🌤️ [WEER] Regex match: {match.groups()}")
+                groups = match.groups()
+                
+                if len(groups) == 3 and groups[0].isalpha():  # Month day format
+                    month, day, year = groups
+                elif len(groups) == 3 and groups[1].isalpha():  # Day month format  
+                    day, month, year = groups
+                else:  # Numeric format
+                    # Assume MM/DD format for now, but could be enhanced
+                    month, day, year = groups
+                break
+        
+        if day and month:
+            try:
+                if not year:
+                    year = str(today.year)
+                
+                # English month map only
+                month_map = {
+                    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+                    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+                    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+                }
+                
+                month_num = int(month) if month.isdigit() else month_map.get(month.lower(), 0)
+                
+                if month_num == 0:
+                    logging.warning(f"🌤️ [WEER] Unknown month: {month}")
+                    return f"Sorry, I don't recognize the month '{month}'."
+                
+                target_date = datetime(int(year), month_num, int(day)).date()
+                logging.info(f"🌤️ [WEER] Parsed target date: {target_date}")
+                
+            except ValueError as e:
+                logging.warning(f"🌤️ [WEER] Invalid date values: {e}")
+                return "Sorry, the date you provided is not valid."
+            except Exception as e:
+                logging.warning(f"🌤️ [WEER] Failed to parse date: {e}")
+                # If parsing fails, use today's date
+                target_date = today
+
+    # Check API limit
+    if target_date > today + timedelta(days=15):
+        logging.warning(f"🌤️ [WEER] Target date {target_date} is too far in the future.")
+        return "Sorry, ik kan geen weerdata ophalen voor zo ver in de toekomst. Vraag iets binnen de komende 15 dagen 💨."
+
+    start_date = end_date = target_date.isoformat()
+
+    # Fix: daily parameter should be a comma-separated string, not a list
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,cloud_cover_mean",
+        "timezone": "Europe/Brussels"
+    }
+
+    logging.info(f"🌤️ [WEER] Requesting Open-Meteo with params: {params}")
+
+    try:
+        response = requests.get(base_url, params=params, timeout=5)
+        logging.info(f"🌤️ [WEER] API status code: {response.status_code}")
+
+        if response.status_code != 200:
+            logging.error(f"🌤️ [WEER] API returned error status: {response.status_code}")
+            logging.error(f"🌤️ [WEER] API response: {response.text}")
+            return "Sorry, ik kon het weer niet ophalen."
+
+        data = response.json()
+        logging.debug(f"🌤️ [WEER] API raw JSON: {data}")
+
+        # Check for errors in the response
+        if "error" in data:
+            logging.error(f"🌤️ [WEER] API returned error: {data['error']}")
+            return "Sorry, ik kon het weer niet ophalen."
+
+        if "daily" not in data:
+            logging.error("🌤️ [WEER] 'daily' field missing in Open-Meteo response.")
+            logging.error(f"🌤️ [WEER] Full response: {data}")
+            return "Sorry, ik kon het weer niet ophalen."
+
+        day_data = data["daily"]
+        i = 0
+
+        # Add safety checks for data availability
+        if not day_data or len(day_data.get('temperature_2m_max', [])) == 0:
+            logging.error("🌤️ [WEER] No weather data available for the requested date.")
+            return "Sorry, er zijn geen weergegevens beschikbaar voor deze datum."
+
+        return (
+            f"📅 Weather forecast for {target_date.strftime('%B %d, %Y')} in Brussels:\n"
+            f"- 🌡️ Max temp: {day_data['temperature_2m_max'][i]}°C\n"
+            f"- 🌡️ Min temp: {day_data['temperature_2m_min'][i]}°C\n"
+            f"- ☁️ Cloud cover: {day_data['cloud_cover_mean'][i]}%\n"
+            f"- 💨 Wind: {day_data['wind_speed_10m_max'][i]} km/h\n"
+            f"- 🌧️ Precipitation: {day_data['precipitation_sum'][i]} mm\n"
+        )
+
+    except requests.exceptions.Timeout:
+        logging.error("🌤️ [WEER] Request timed out")
+        return "Sorry, de weerservice reageert niet. Probeer het later opnieuw."
+    except requests.exceptions.RequestException as e:
+        logging.error(f"🌤️ [WEER] Request error: {e}")
+        return "Sorry, ik kon het weer niet ophalen vanwege een netwerkfout."
+    except Exception as e:
+        logging.error(f"🌤️ [WEER] Error fetching weather data: {e}")
+        return "Sorry, ik kon het weer niet ophalen."
+
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -153,6 +327,10 @@ def get_chatgpt_response(prompt):
     try:
         pixels.think()
         logging.info("Analyzing prompt...")
+        if is_weather_related(prompt):
+            logging.info("Prompt is weather-related. Fetching Open-Meteo data for Brussels.")
+            weather_response = get_weather_forecast_for(prompt)
+            return weather_response
 
         # ----- Forecast prompt -----
         if is_forecast_related(prompt):
