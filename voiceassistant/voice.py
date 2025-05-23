@@ -507,6 +507,8 @@ def speak_text(text):
         is_speaking.clear()
         pixels.off()
 
+from flask import Flask, request, jsonify
+import threading
 # Flask App for receiving prompts from Windows Forms
 app = Flask(__name__)
 
@@ -514,12 +516,20 @@ app = Flask(__name__)
 def receive_prompt():
     data = request.json
     prompt = data.get('prompt')
-    if prompt:
-        print(f"Received prompt: {prompt}")
-        response_text = get_chatgpt_response(prompt)
-        speak_text(response_text)
-        return {"status": "success", "response": response_text}
-    return {"status": "error", "response": "No prompt received."}, 400
+    if not prompt:
+        return jsonify(status="error", response="No prompt received."), 400
+
+    # 1) Haal de GPT-response op
+    response_text = get_chatgpt_response(prompt)
+
+    # 2) Start de TTS in een daemon-thread: geen blokkade meer op de HTTP-request
+    threading.Thread(
+        target=lambda: speak_text(response_text),
+        daemon=True
+    ).start()
+
+    # 3) Stuur de client meteen de textuele response
+    return jsonify(status="success", response=response_text)
 
 def run_flask():
     app.run(host='0.0.0.0', port=5000, debug=False)
@@ -604,7 +614,7 @@ def voice_conversation_loop():
             continue
 
         # 2) Wake-word heard: respond and enter conversation mode
-        speak_text("ja")
+        speak_text("I'm listening!")
 
         # 3) Conversation loop
         while True:
