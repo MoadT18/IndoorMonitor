@@ -1,40 +1,40 @@
 import subprocess
 import requests
 import time
-
-
 import sys
 import os
 import contextlib
-
 import speech_recognition as sr
-
-
-
 from elevenlabs import play
 from elevenlabs.client import ElevenLabs
-
 from speech_recognition import Microphone
 from openai import OpenAI
 from dateutil import parser
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import threading
-import os
-import sys
-
 import signal
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
-import json
 from pydub import AudioSegment
 from pydub.playback import _play_with_simpleaudio
 import io
-
-import tinytuya                  # ← hiertoe toegevoegd
+import tinytuya
+import re
+from spotipy import Spotify
+from spotipy.oauth2 import SpotifyOAuth
+from pixels import Pixels
+import socket
+import pytz
+import schedule
+import yt_dlp
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from spotipy import Spotify
+from spotipy.oauth2 import SpotifyOAuth
 
 mpv_process = None
 
@@ -47,21 +47,15 @@ IP_ADDRESS = '192.168.0.192'
 LOCAL_KEY  = 'pfOycOv!!s!7K@ov'
 VERSION    = 3.3
 # ────────────────────────────
-#hey
+
 is_speaking = threading.Event()
-
-#hoi
-
-from pixels import Pixels
 
 # Initialize the Pixels object
 pixels = Pixels()
 
-# Optional: Test the LEDs on startup
+# Test the LEDs on startup
 pixels.wakeup()
 time.sleep(3)
-
-
 
 # API Keys
 # Dynamisch pad naar api_keys.json
@@ -79,7 +73,6 @@ elevenlabs_client = ElevenLabs(api_key=elevenlabs_api_key)
 
 # Config
 API_PORT = 8001
-import socket
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -120,27 +113,23 @@ def kill_process_on_port(port):
         result = subprocess.run(['lsof', '-i', f':{port}'], 
                               stdout=subprocess.PIPE, 
                               text=True)
-        
+
         lines = result.stdout.strip().split('\n')
-        if len(lines) > 1:  # Header + at least one process
-            # Extract PID from the second line (first process)
-            # Format is: COMMAND  PID  USER  ... 
+        if len(lines) > 1:
             process_info = lines[1].split()
             if len(process_info) > 1:
                 pid = process_info[1]
                 print(f"Killing process {pid} using port {port}")
                 os.kill(int(pid), signal.SIGTERM)
-                time.sleep(1)  # Give process time to terminate
+                time.sleep(1)
                 return True
     except Exception as e:
         print(f"Error killing process on port {port}: {e}")
-    
     return False
 
 
 def control_light(on: bool):
     try:
-      
         d = tinytuya.Device(DEVICE_ID, IP_ADDRESS, LOCAL_KEY, version=VERSION)
         d.set_version(VERSION)
         # DP 20 = switch
@@ -156,11 +145,8 @@ def get_latest_air_quality():
         print(f"Fetching data from {LOCAL_API_URL}")
         response = requests.get(LOCAL_API_URL, timeout=5)
         print(f"Response status: {response.status_code}")
-        
         if response.status_code == 200:
             data = response.json()
-            
-            # If data is a list, get the first item
             if isinstance(data, list) and len(data) > 0:
                 latest = data[0]
                 print(f"Found array data, using first item: ID={latest.get('id')}, CO2={latest.get('co2')}")
@@ -175,19 +161,17 @@ def get_latest_air_quality():
         print(f"Error fetching air quality data: {e}")
         return None
 
-
-
-# Helper for detecting climate-related questions
+# Helper for detecting indoor climate-related questions
 def is_climate_related(prompt):
     keywords = ["temperature", "humidity", "co2", "air", "climate", "room", "indoor"]
     return any(kw in prompt.lower() for kw in keywords)
 
-
+# Helper for detecting forecast-related question
 def is_forecast_related(prompt):
     keywords = ["forecast"]
     return any(kw in prompt.lower() for kw in keywords)
 
-
+# Helper for detecting weather-related questions
 def is_weather_related(prompt: str) -> bool:
     prompt_lower = prompt.lower()
     return any(keyword in prompt_lower for keyword in [
@@ -196,10 +180,6 @@ def is_weather_related(prompt: str) -> bool:
 
 
 def get_weather_forecast_for(prompt: str) -> str:
-    import re
-    import requests
-    import logging
-    from datetime import datetime, timedelta
 
     logging.info("🌤️ [WEER] Start weather forecast handler...")
     base_url = "https://api.open-meteo.com/v1/forecast"
@@ -208,7 +188,6 @@ def get_weather_forecast_for(prompt: str) -> str:
     today = datetime.now().date()
     target_date = today
 
-    # Detect relative date
     clean_prompt = prompt.lower()
     if "tomorrow" in clean_prompt:
         target_date = today + timedelta(days=1)
@@ -232,9 +211,9 @@ def get_weather_forecast_for(prompt: str) -> str:
         target_date = today - timedelta(days=7)
         logging.info(f"🌤️ [WEER] Detected 'last week'. Target date: {target_date}")
     else:
-        # Clean prompt for better regex matching (remove punctuation)
+        # Clean prompt (remove punctuation)
         clean_prompt = re.sub(r'[?!.,;]', '', prompt.lower())
-        
+
         # Detect specific date - supports multiple formats:
         # "may 25", "25 may", "may 25 2025", "25 may 2025", "25/05", "05/25/2025"
         date_patterns = [
@@ -245,29 +224,29 @@ def get_weather_forecast_for(prompt: str) -> str:
             # Numeric formats: "05/25", "25/05", "05/25/2025", "25/05/2025"
             r'(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?'
         ]
-        
+
         day = month = year = None
-        
+
         for pattern in date_patterns:
             match = re.search(pattern, clean_prompt)
             if match:
                 logging.info(f"🌤️ [WEER] Regex match: {match.groups()}")
                 groups = match.groups()
-                
+
                 if len(groups) == 3 and groups[0].isalpha():  # Month day format
                     month, day, year = groups
-                elif len(groups) == 3 and groups[1].isalpha():  # Day month format  
+                elif len(groups) == 3 and groups[1].isalpha():  # Day month format
                     day, month, year = groups
                 else:  # Numeric format
                     # Assume MM/DD format for now, but could be enhanced
                     month, day, year = groups
                 break
-        
+
         if day and month:
             try:
                 if not year:
                     year = str(today.year)
-                
+
                 # English month map only
                 month_map = {
                     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -275,16 +254,15 @@ def get_weather_forecast_for(prompt: str) -> str:
                     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
                     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
                 }
-                
+
                 month_num = int(month) if month.isdigit() else month_map.get(month.lower(), 0)
-                
                 if month_num == 0:
                     logging.warning(f"🌤️ [WEER] Unknown month: {month}")
                     return f"Sorry, I don't recognize the month '{month}'."
-                
+
                 target_date = datetime(int(year), month_num, int(day)).date()
                 logging.info(f"🌤️ [WEER] Parsed target date: {target_date}")
-                
+
             except ValueError as e:
                 logging.warning(f"🌤️ [WEER] Invalid date values: {e}")
                 return "Sorry, the date you provided is not valid."
@@ -301,7 +279,6 @@ def get_weather_forecast_for(prompt: str) -> str:
 
     start_date = end_date = target_date.isoformat()
 
-    # Fix: daily parameter should be a comma-separated string, not a list
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -363,13 +340,7 @@ def get_weather_forecast_for(prompt: str) -> str:
         return "Sorry, ik kon het weer niet ophalen."
 
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-from datetime import datetime
-import pytz
-import requests
-import logging
 
 def get_chatgpt_response(prompt):
     """
@@ -378,6 +349,47 @@ def get_chatgpt_response(prompt):
     try:
         pixels.think()
         logging.info("Analyzing prompt...")
+
+        # ─── MUSIC HANDLER ─────────────────────────────────────────────────────────────
+
+        #if prompt.startswith("play "):
+             #target = prompt[len("play "):].strip()
+             #result = play_spotify(target)
+             #return result
+
+
+        if prompt.startswith("play "):
+            song_query = prompt[5:].strip()
+            result = play_youtube_music(song_query)
+            return result
+
+        if "pause" in prompt:
+            if send_mpv_command("set_property", ["pause", True]):
+                return "⏸️ Music paused."
+            return "Couldn't pause the music."
+
+        if "resume" in prompt or "continue" in prompt:
+            if send_mpv_command("set_property", ["pause", False]):
+                return "▶️ Music resumed."
+            return "Couldn't resume the music."
+
+        if "skip" in prompt or "next" in prompt:
+            success = send_mpv_command("playlist-next")
+            if success:
+                return "⏭️ Skipped to the next track."
+            else:
+                return "There’s no next song to skip to."
+
+        if "stop music" in prompt or "stop song" in prompt:
+            try:
+                subprocess.run(["pkill", "-f", "mpv"], check=True)
+                return "🎶 Music has been stopped."
+            except subprocess.CalledProcessError:
+                return "There is currently no music playing."
+            except Exception as e:
+                logging.error(f"❌ Error stopping music: {e}")
+                return "Something went wrong when stopping the music."
+
         if 'light' in prompt and 'on' in prompt:
                 if control_light(True):
                         return('Light is now on!')
@@ -389,7 +401,7 @@ def get_chatgpt_response(prompt):
 
                 else:
                         return('Sorry, ik kon de lamp niet uitzetten.')
-        
+
         if 'measure' in prompt and 'now' in prompt:
             logging.info("Manual execution of measurement script triggered.")
             try:
@@ -428,9 +440,6 @@ def get_chatgpt_response(prompt):
                 logging.error(f"Forecast execution failed: {e}")
                 return f"❌ Couldnt perform the forecast: {e}"
 
-        
-
-
 
         if is_weather_related(prompt):
             logging.info("Prompt is weather-related. Fetching Open-Meteo data for Brussels.")
@@ -458,22 +467,18 @@ def get_chatgpt_response(prompt):
                     )
 
                     extended_prompt = (
-                        "The following is a 7-day forecast for indoor climate (CO₂ and temperature) and outdoor weather conditions "
-                        "based on predicted sensor data and external weather input from Open-Meteo. The data includes:\n"
-                        "- Predicted indoor CO₂ levels (`pred_co2`)\n"
-                        "- Predicted indoor temperature (`pred_temp`)\n"
-                        "- Outside weather data: `outside_temp_max`, `solar_radiation`, `precipitation`, `cloudcover`, `wind`\n\n"
-                        "Your task is to provide a personalized daily forecast for each of the 7 days **in the future**.\n"
-                        "Always use this format for each day:\n"
-                        "- **Date**\n"
-                        "- **Forecast**: Clearly state the predicted CO₂ and indoor temperature, followed by all relevant weather data (outside max temp, solar, wind, rain, etc.)\n"
-                        "- **Advice**: Give specific ventilation and heating recommendations **as if the day is still coming**.\n"
-                        "Be realistic and human: suggest when to open or close windows, reduce heating, or take no action. Always explain *why* based on the numbers.\n\n"
+                        "You are Luna, a helpful assistant giving future indoor climate forecasts based on predicted CO₂, indoor temperature, and outdoor weather data.\n"
+                        "For each day, include:\n"
+                        "- Date\n"
+                        "- Forecast: Indoor CO₂ (ppm), indoor temperature (°C), and outdoor values: max temperature, solar radiation, wind, rain, and cloud cover.\n"
+                        "- Advice: Give specific ventilation or heating tips using both indoor and outdoor context. Always explain *why*, based on outdoor temp, wind, cloud cover, solar radiation, or rain. For example, mention if it's good to ventilate early morning due to cool air, or avoid it if it's rainy or too hot.\n"
+                        "Do not use formatting like ** or *.\n\n"
                         f"Forecast data:\n{forecast_table}\n\n"
                         f"User question: {prompt}\n"
-                        "Respond with a full 7-day forecast breakdown using the format above. Write like a helpful assistant giving future-oriented advice."
-
+                        "Write the 7-day forecast using the format above."
                     )
+
+
                 else:
                     logging.warning("Could not retrieve forecast data. Using fallback prompt.")
                     extended_prompt = f"The user asked: {prompt}\nRespond as Luna, a helpful and emotional human assistant."
@@ -528,12 +533,14 @@ def get_chatgpt_response(prompt):
 
                     extended_prompt = (
                         "Here is today's climate data, sorted by time:\n"
-                        f"{climate_table}\n"
-                        "\nImportant data:\n"
-                        f"Highest CO₂ level: {highest_entry['co2']} ppm at {highest_entry['timestamp']}\n"
-                        f"Lowest CO₂ level: {lowest_entry['co2']} ppm at {lowest_entry['timestamp']}\n"
+                        f"{climate_table}\n\n"
+                        "Important data:\n"
+                        f"Highest CO₂ level: {highest_entry['co2']} ppm at {datetime.fromisoformat(highest_entry['timestamp']).strftime('%H:%M')}\n"
+                        f"Lowest CO₂ level: {lowest_entry['co2']} ppm at {datetime.fromisoformat(lowest_entry['timestamp']).strftime('%H:%M')}\n\n"
                         f"User question: {prompt}\n"
-                        "Please use this data to answer the user's question in a concise and helpful way."
+                        "Please use this data to answer the user's question in a clear and helpful way.\n"
+                        "Do not use any formatting such as bold, italic, or special markdown. Your answer must be in plain text only.\n"
+                        "If you were about to use symbols like * or **, replace them with nothing. Just write plain headings or dashes."
                     )
                 else:
                     extended_prompt = f"The user asked: {prompt}\nRespond as Luna, a helpful and emotional human assistant."
@@ -555,12 +562,13 @@ def get_chatgpt_response(prompt):
         ai_resp = openai_client.chat.completions.create(
             model="gpt-4-turbo",
             messages=trimmed_history,
-            max_tokens=800,
+            max_tokens=1000,
             temperature=0.8 #adds creativity
         )
         message = ai_resp.choices[0].message.content.strip()
         logging.info(f"ChatGPT response: {message}")
         pixels.off()
+
         conversation_history.append({"role": "assistant", "content": message})
         return message
 
@@ -590,12 +598,38 @@ def trim_conversation_history(history, max_tokens=MAX_TOKENS, buffer=RESERVED_TO
     return trimmed_history
 
 
+def weekly_forecast_summary():
+    """
+    Haalt wekelijks op maandag om 11:30 de forecast-advies op en laat het horen.
+    """
+    try:
+        prompt = "What’s the forecast advice for the coming days?"
+        logging.info("📅 Weekly forecast prompt triggered.")
+        response = get_chatgpt_response(prompt)
+        speak_text(response)
+    except Exception as e:
+        logging.error(f"❌ Error during weekly forecast summary: {e}")
 
 
-import yt_dlp
+def schedule_tasks():
+    # Elke maandag om 11:30
+    schedule.every().sunday.at("11:30").do(weekly_forecast_summary)
+
+    def run_schedule_loop():
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
+
+    scheduler_thread = threading.Thread(target=run_schedule_loop, daemon=True)
+    scheduler_thread.start()
+
+MPV_SOCKET = "/tmp/mpvsocket"
 
 def play_youtube_music(query: str):
     try:
+        # Stop eventueel bestaande mpv
+        subprocess.run(["pkill", "-f", "mpv"], check=False)
+
         ydl_opts = {
             'format': 'bestaudio/best',
             'noplaylist': True,
@@ -612,13 +646,132 @@ def play_youtube_music(query: str):
             else:
                 video_url = info_dict['webpage_url']
 
-        subprocess.Popen(['mpv', '--no-video', video_url])
+        # Start mpv met IPC
+        subprocess.Popen([
+            'mpv', '--no-video', video_url,
+            f'--input-ipc-server={MPV_SOCKET}'
+        ])
         return f"🎵 Playing: {video.get('title', 'your song')}"
     except Exception as e:
         logging.error(f"❌ Error playing music: {e}")
         return "Sorry, I couldn’t play that song."
 
 
+
+def send_mpv_command(command, args=None):
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(MPV_SOCKET)
+
+        cmd_obj = {
+            "command": [command] if args is None else [command] + args
+        }
+        client.send((json.dumps(cmd_obj) + '\n').encode('utf-8'))
+        client.close()
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send command to MPV: {e}")
+        return False
+
+
+# ─── Spotify player setup ────────────────────────────────────────────────────────────
+
+# ─── Logging & paths ────────────────────────────────────────────────────────────
+'''
+logging.basicConfig(level=logging.INFO)
+base_dir = os.path.dirname(__file__)
+CACHE_PATH = os.path.join(base_dir, ".spotify_token_cache")
+
+# ─── Spotify OAuth setup ─────────────────────────────────────────────────────────
+SPOTIPY_CLIENT_ID     = keys["spotify_client_id"]
+SPOTIPY_CLIENT_SECRET = keys["spotify_client_secret"]
+SPOTIPY_REDIRECT_URI  = keys["spotify_redirect_uri"]
+
+sp_oauth = SpotifyOAuth(
+    client_id=SPOTIPY_CLIENT_ID,
+    client_secret=SPOTIPY_CLIENT_SECRET,
+    redirect_uri=SPOTIPY_REDIRECT_URI,
+    scope="user-modify-playback-state user-read-playback-state",
+    cache_path=CACHE_PATH,
+    open_browser=False
+)
+
+# ─── HTTP callback catcher ────────────────────────────────────────────────────────
+class CallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        code = params.get("code", [None])[0]
+        if code:
+            self.server.auth_code = code
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<h1>Spotify authorization complete.</h1>")
+        else:
+            self.send_response(400)
+            self.end_headers()
+
+# ─── One-time headless auth ─────────────────────────────────────────────────────
+token_info = sp_oauth.get_cached_token()
+if not token_info:
+    # Parse host & port from your redirect URI
+    parsed = urllib.parse.urlparse(SPOTIPY_REDIRECT_URI)
+    server = HTTPServer((parsed.hostname, parsed.port), CallbackHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # Prompt you to open the URL once
+    auth_url = sp_oauth.get_authorize_url()
+    print("\nGo here to authorize Spotify:\n", auth_url, "\n")
+
+    while not hasattr(server, "auth_code"):
+        time.sleep(1)
+
+    sp_oauth.get_access_token(code=server.auth_code, as_dict=True)
+
+    server.shutdown()
+
+# ─── create Spotify client ──────────────────────────────────────────────
+sp = Spotify(auth_manager=sp_oauth)
+
+def play_spotify(resource: str) -> str:
+    """
+    resource can be:
+      - a full open.spotify.com URL
+      - a spotify:track/... URI
+      - just a song title
+    """
+    # 1) detect full URL or raw URI
+    m = re.search(
+        r"(spotify:(?:track|album|playlist):[A-Za-z0-9]+|https?://open\.spotify\.com/(?:track|album|playlist)/[A-Za-z0-9]+)",
+        resource
+    )
+    if m:
+        raw = m.group(1).split("?")[0]
+        uri = raw if raw.startswith("spotify:") else raw.replace("https://open.spotify.com/", "spotify:")
+    else:
+        # fallback: treat resource as a song title
+        res = sp.search(q=f"track:{resource}", type="track", limit=1)
+        items = res["tracks"]["items"]
+        if not items:
+            return f"❌ Couldn't find '{resource}' on Spotify."
+        uri = items[0]["uri"]
+    logging.info(f"🎧 Playing Spotify URI: {uri}")
+
+    # 2) find an active device
+    devices = sp.devices().get("devices", [])
+    if not devices:
+        return "❌ No active Spotify Connect devices found!"
+    device_id = devices[0]["id"]
+    device_name = devices[0]["name"]
+
+    # 3) start playback
+    if uri.startswith("spotify:track"):
+        sp.start_playback(device_id=device_id, uris=[uri])
+    else:
+        sp.start_playback(device_id=device_id, context_uri=uri)
+
+    return f"🎵 Now playing on {device_name}: {uri}"
+'''
 
 # Generate speech with ElevenLabs
 stop_speaking = threading.Event()
@@ -651,15 +804,13 @@ def speak_text(text):
                     logging.info("🛑 'Stop' gedetecteerd – afspelen onderbroken.")
             except Exception as e:
                 logging.warning(f"[interrupt] Fout tijdens herkenning: {e}")
-
-        # 🎤 Setup background recognizer met betere drempel
         background_recognizer = sr.Recognizer()
-        background_recognizer.energy_threshold = 4000  # 👈 Verhoog gevoeligheid
+        background_recognizer.energy_threshold = 4000
         background_recognizer.dynamic_energy_threshold = False
 
         bg_source = sr.Microphone()
         stop_listener = background_recognizer.listen_in_background(
-            bg_source, check_stop, phrase_time_limit=1  # 👈 snellere response
+            bg_source, check_stop, phrase_time_limit=1
         )
 
         while playback.is_playing():
@@ -677,9 +828,6 @@ def speak_text(text):
         pixels.off()
 
 
-
-from flask import Flask, request, jsonify
-import threading
 # Flask App for receiving prompts from Windows Forms
 app = Flask(__name__)
 
@@ -719,34 +867,6 @@ def start_fastapi_server():
     except Exception as e:
         print(f"Kon FastAPI-server niet starten: {e}")
 
-
-'''
-
-def voice_recognition_loop():
-    # Voice loop
-    while True:
-        with mic as source:
-            recognizer.adjust_for_ambient_noise(source, duration=1)
-           print("I'm listening now.")
-            print("Luna luistert...")
-            try:
-                audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
-                command = recognizer.recognize_google(audio)
-                print(f"Jij zei: {command}")
-                response_text = get_chatgpt_response(command)
-                print(f"Luna: {response_text}")
-                speak_text(response_text)
-            except sr.WaitTimeoutError:
-                print("Ik hoor niets, probeer opnieuw.")
-            except sr.UnknownValueError:
-                print("Sorry, dat verstond ik niet.")
-            except sr.RequestError as e:
-                print("Speech recognition error, probeer het opnieuw.")
-
-
-'''
-
-import logging
 
 logging.basicConfig(
     level=logging.INFO,
@@ -805,9 +925,6 @@ def voice_conversation_loop():
                     command = recognizer.recognize_google(cmd_audio)
                     logging.info(f"User said: {command}")
                     lower_cmd = command.lower()
-
-                    
-                    
                 except (sr.WaitTimeoutError, sr.UnknownValueError):
                     logging.info("Silence → back to wake-word.")
                     break
@@ -816,30 +933,71 @@ def voice_conversation_loop():
                     speak_text("Sorry, er ging iets mis.")
                     break
 
-            if lower_cmd.startswith("play "):
-                song_query = lower_cmd[5:].strip()
-                result = play_youtube_music(song_query)
-                speak_text(result)
+            response = get_chatgpt_response(command)
+            speak_text(response)
 
 
-            elif lower_cmd in ["stop music", "stop song"]:
-                
+def global_music_listener():
+    """
+    Luistert continu naar muziekcommando’s buiten wake-word om.
+    Ondersteunt: stop, pause, resume, next song.
+    """
+    local_recognizer = sr.Recognizer()
+    local_mic = sr.Microphone()
+
+    while True:
+        try:
+            with local_mic as source:
+                local_recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = local_recognizer.listen(source, timeout=1, phrase_time_limit=4)
+
+            command = local_recognizer.recognize_google(audio).lower()
+            logging.info(f"[🎧 Global Music Listener] Heard: {command}")
+
+            # find your active Spotify Connect device
+            devices = sp.devices().get("devices", [])
+            if not devices:
+                speak_text("❌ No active Spotify Connect device found.")
+                continue
+            device_id = devices[0]["id"]
+
+            if command in ["stop music", "stop song"]:
                 try:
-                    subprocess.run(["pkill", "-f", "mpv"], check=True)
+                    sp.pause_playback(device_id=device_id)
                     speak_text("🎶 Music has been stopped.")
-                    
-                except subprocess.CalledProcessError:
-                    speak_text("There is currently no music playing.")
                 except Exception as e:
                     logging.error(f"❌ Error stopping music: {e}")
                     speak_text("Something went wrong when stopping the music.")
-            else:
 
-                # Alles wat niet over de lamp gaat, via ChatGPT
-                response = get_chatgpt_response(command)
-                speak_text(response)
+            elif command in ["pause", "pause music", "pause song"]:
+                try:
+                    sp.pause_playback(device_id=device_id)
+                    speak_text("⏸️ Music paused.")
+                except Exception as e:
+                    logging.error(f"❌ Error pausing music: {e}")
+                    speak_text("Sorry, I couldn't pause the music.")
 
+            elif command in ["resume", "resume music", "resume song"]:
+                try:
+                    sp.start_playback(device_id=device_id)
+                    speak_text("▶️ Music resumed.")
+                except Exception as e:
+                    logging.error(f"❌ Error resuming music: {e}")
+                    speak_text("Sorry, I couldn't resume the music.")
 
+            elif command in ["next song", "skip song", "next"]:
+                try:
+                    sp.next_track(device_id=device_id)
+                    speak_text("⏭️ Skipping to the next track.")
+                except Exception as e:
+                    logging.error(f"❌ Error skipping track: {e}")
+                    speak_text("Sorry, I couldn't skip the song.")
+
+        except (sr.WaitTimeoutError, sr.UnknownValueError):
+            continue
+        except sr.RequestError as e:
+            logging.error(f"[Global Music Listener] API error: {e}")
+            continue
 
 
 def speak_message(text):
@@ -856,7 +1014,6 @@ def monitor_co2_threshold(interval_seconds=5, threshold=1000):
 
     while True:
         try:
-            # Forceren van vaste URL naar poort 8000
             response = requests.get(f"http://{get_local_ip()}:8000/data", timeout=2)
             response.raise_for_status()
             data = response.json()
@@ -890,6 +1047,48 @@ def monitor_co2_threshold(interval_seconds=5, threshold=1000):
             logging.error(f"❌ Fout tijdens CO₂-monitoring: {e}")
 
         time.sleep(interval_seconds)
+
+def speak_forecast_warnings(interval_seconds=7200):
+    """
+    Elke `interval_seconds` (standaard: 2 uur) checkt de forecast van vandaag.
+    Spreekt een waarschuwing uit als CO2 >= 1000 ppm OF temperatuur >= 25°C.
+    """
+
+
+    while True:
+        try:
+            response = requests.get(f"http://{get_local_ip()}:8001/forecast", timeout=5)
+            response.raise_for_status()
+            forecast = response.json()
+
+            # [🔧] Voor testdoeleinden kun je dit hard coderen:
+            #today = datetime(2025, 5, 11).date()
+            today = datetime.now(pytz.timezone("Europe/Brussels")).date()
+
+            for entry in forecast:
+                forecast_date = datetime.fromisoformat(entry["ds"]).astimezone(pytz.timezone("Europe/Brussels")).date()
+                if forecast_date == today:
+                    co2 = entry.get("pred_co2", 0)
+                    temp = entry.get("pred_temp", 0)
+                    message_parts = []
+
+                    if co2 >= 1000:
+                        message_parts.append(f"CO₂ is expected to reach {round(co2)} ppm.")
+
+                    if temp >= 25:
+                        message_parts.append(f"The indoor temperature may rise to {round(temp)} degrees.")
+
+                    if message_parts:
+                        advice = " ".join(message_parts) + " Please prepare to ventilate or keep your room cool."
+                        speak_message(advice)
+
+                    break
+
+        except Exception as e:
+            logging.error(f"❌ Error during forecast CO₂/temperature check: {e}")
+
+        time.sleep(interval_seconds)
+
 
 fastapi_app = FastAPI()
 
@@ -964,9 +1163,22 @@ def main():
     co2_monitor_thread = threading.Thread(target=monitor_co2_threshold, daemon=True)
     co2_monitor_thread.start()
 
-    # Start voice recognition loop (blokkeert verder)
+    time.sleep(10)
+
+    # Start forecast warning checker (elke 2 uur)
+    forecast_warning_thread = threading.Thread(target=speak_forecast_warnings, daemon=True)
+    forecast_warning_thread.start()
+
+    time.sleep(10)
+
+    schedule_tasks()
+
+    # Start voice recognition loop
     voice_conversation_loop()
 
+    # Start globale muziekcommando listener
+    music_listener_thread = threading.Thread(target=global_music_listener, daemon=True)
+    music_listener_thread.start()
 
 if __name__ == "__main__":
     main()
