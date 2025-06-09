@@ -349,6 +349,9 @@ def get_chatgpt_response(prompt):
     try:
         pixels.think()
         logging.info("Analyzing prompt...")
+        logging.info(f"🔎 is_forecast_related: {is_forecast_related(prompt)}")
+        logging.info(f"📅 is_specific_day_forecast: {is_specific_day_forecast(prompt)}")
+
 
         # ─── MUSIC HANDLER ─────────────────────────────────────────────────────────────
 
@@ -446,8 +449,48 @@ def get_chatgpt_response(prompt):
             weather_response = get_weather_forecast_for(prompt)
             return weather_response
 
-        # ----- Forecast prompt -----
-        if is_forecast_related(prompt):
+
+        # ----- Specific day forecast (today, tomorrow, specific date) -----
+        # Check this FIRST before general forecast check
+        if is_forecast_related(prompt) and is_specific_day_forecast(prompt):
+            logging.info("Prompt is asking for specific day forecast. Fetching forecast data.")
+            try:
+                forecast_resp = requests.get(f"http://{get_local_ip()}:8001/forecast", timeout=5)
+                if forecast_resp.status_code == 200:
+                    forecast_data = forecast_resp.json()
+                    target_date = get_target_date_from_prompt(prompt)
+                    
+                    # Find the matching forecast entry
+                    matching_entry = None
+                    for entry in forecast_data:
+                        entry_date = entry['ds'][:10]  # Extract YYYY-MM-DD
+                        if entry_date == target_date:
+                            matching_entry = entry
+                            break
+                    
+                    if matching_entry:
+                        day_name = get_day_name_from_prompt(prompt, target_date)
+                        response = (
+                            f"Forecast for {day_name} ({target_date}):\n"
+                            f"Predicted CO₂: {round(matching_entry['pred_co2'])} ppm\n"
+                            f"Predicted Temperature: {round(matching_entry['pred_temp'], 1)}°C\n"
+                            f"Advice: {matching_entry.get('advies', 'No specific advice available')}"
+                        )
+                        pixels.off()
+                        return response
+                    else:
+                        pixels.off()
+                        return f"Sorry, I don't have forecast data for {target_date}."
+                else:
+                    pixels.off()
+                    return "Sorry, I couldn't retrieve the forecast data right now."
+            except Exception as e:
+                logging.error(f"Error while fetching specific day forecast: {e}")
+                pixels.off()
+                return "Sorry, something went wrong while getting the forecast."
+
+        # ----- General forecast prompt -----
+        elif is_forecast_related(prompt):
             logging.info("Prompt is forecast-related. Fetching forecast data.")
             try:
                 forecast_resp = requests.get(f"http://{get_local_ip()}:8001/forecast", timeout=5)
@@ -485,6 +528,8 @@ def get_chatgpt_response(prompt):
             except Exception as e:
                 logging.error(f"Error while fetching forecast data: {e}")
                 extended_prompt = f"The user asked: {prompt}\nRespond as Luna, a helpful and emotional human assistant."
+
+
 
         # ----- Climate data prompt (/data) -----
         elif is_climate_related(prompt):
@@ -578,6 +623,65 @@ def get_chatgpt_response(prompt):
 
 MAX_TOKENS = 16385  # Global max tokens for GPT-4
 RESERVED_TOKENS = 1000  # Leave space for current prompt
+
+
+def is_specific_day_forecast(prompt):
+    return extract_date_from_prompt(prompt) is not None
+
+
+def extract_date_from_prompt(prompt):
+    import dateparser
+    import re
+    
+    date_patterns = [
+        r'\b(?:on\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?\b',
+        r'\b(?:on\s+)?\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b',
+        r'\btomorrow\b',
+        r'\btoday\b',
+        r'\byesterday\b'
+    ]
+    
+    for pattern in date_patterns:
+        matches = re.findall(pattern, prompt.lower())
+        for match in matches:
+            cleaned_match = re.sub(r'\bon\s+', '', match)
+            parsed = dateparser.parse(cleaned_match)
+            if parsed is not None:
+                return parsed
+    return None
+
+import dateparser
+from datetime import datetime
+
+def get_target_date_from_prompt(prompt):
+    from datetime import datetime
+    parsed = extract_date_from_prompt(prompt)
+    if parsed:
+        return parsed.strftime('%Y-%m-%d')
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+
+def get_day_name_from_prompt(prompt, target_date):
+    """
+    Get a friendly day name for the response.
+    """
+    from datetime import datetime
+    
+    prompt_lower = prompt.lower()
+    
+    if 'today' in prompt_lower:
+        return 'today'
+    elif 'tomorrow' in prompt_lower:
+        return 'tomorrow'
+    else:
+        # Convert target_date to day name
+        date_obj = datetime.strptime(target_date, '%Y-%m-%d')
+        return date_obj.strftime('%A')  # Full weekday name
+
+
+
+
 
 def trim_conversation_history(history, max_tokens=MAX_TOKENS, buffer=RESERVED_TOKENS):
     """
@@ -1004,7 +1108,7 @@ def speak_message(text):
     speak_text(text)
 
 
-def monitor_co2_threshold(interval_seconds=5, threshold=1000):
+def monitor_co2_threshold(interval_seconds=5, threshold=900):
     """
     Elke `interval_seconds` seconden ophalen van http://pi.local:8000/data,
     vergelijken op ID en bij CO₂ ≥ threshold waarschuwen.
@@ -1073,13 +1177,13 @@ def speak_forecast_warnings(interval_seconds=7200):
                     message_parts = []
 
                     if co2 >= 1000:
-                        message_parts.append(f"CO₂ is expected to reach {round(co2)} ppm.")
+                        message_parts.append(f"The CO₂ is expected to reach {round(co2)} ppm")
 
                     if temp >= 25:
-                        message_parts.append(f"The indoor temperature may rise to {round(temp)} degrees.")
+                        message_parts.append(f"The indoor temperature may rise to {round(temp)} degrees")
 
                     if message_parts:
-                        advice = " ".join(message_parts) + " Please prepare to ventilate or keep your room cool."
+                        advice = " ".join(message_parts) + " today. Please prepare to ventilate or keep your room cool."
                         speak_message(advice)
 
                     break
